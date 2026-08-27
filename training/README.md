@@ -127,6 +127,26 @@ Alternatively, to get aligned transcripts, you could use an ASR with timestamps 
 Finally, you'll need a text tokenizer to be able to feed the text to the model.
 This is just a quick training step - see `train_tokenizer.py`.
 
+`prepare_vieneu.py` is a worked example of all three steps for Vietnamese, on
+[pnnbao-ump/VieNeu-TTS-140h](https://huggingface.co/datasets/pnnbao-ump/VieNeu-TTS-140h)
+(138h, 193 speakers). It is worth reading next to `prepare_data.py`, because the
+two datasets are shaped differently and the manifests still come out identical:
+HiFiTTS-2 ships hour-long chapter mp3s that many utterances seek into, while
+VieNeu ships one short utterance per row with the audio embedded, so its entries
+are whole files at `start: 0.0`. It fits the tokenizer with `train_tokenizer.py`
+and aligns with [nguyenvulebinh/wav2vec2-base-vietnamese-250h](https://huggingface.co/nguyenvulebinh/wav2vec2-base-vietnamese-250h)
+instead of the English default. `training/configs/vietnamese_finetune.yaml` then
+trains on the result:
+
+```bash
+uv run training/scripts/prepare_vieneu.py --align-devices 0,1
+CUDA_VISIBLE_DEVICES=0,1 uv run torchrun --nproc-per-node 2 \
+    training/train.py training/configs/vietnamese_finetune.yaml
+```
+
+`--align-devices` names the physical GPUs the alignment shards are pinned to,
+one each, for boxes where you do not own every GPU.
+
 Just like ingredients matter in cooking, dataset quality is extremely important.
 Here are some common issues and solutions:
 - As mentioned, you should aim for 1000+ hours of data, 100 hours is a minimum.

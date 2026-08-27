@@ -39,6 +39,8 @@ dev = [
     "mkdocs-autolinks-plugin>=0.7.1",
     "mkdocs-material>=9.7.1",
     "mkdocstrings-python>=2.0.1",
+    # scripts/prepare_vieneu.py: reads the dataset's arrow shards
+    "pyarrow>=15.0",
     "pytest>=9.0.2",
     "pytest-xdist>=3.8.0",
     "pyyaml>=6.0",

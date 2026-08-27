@@ -69,16 +69,35 @@ def download(url: str, dest: Path, retries: int = 5, timeout: float = 30) -> Non
             time.sleep(min(2**attempt, 10))
 
 
-def align(manifest: Path, out: Path, shards: int, model: str, what: str = "manifest") -> None:
+def align(
+    manifest: Path,
+    out: Path,
+    shards: int,
+    model: str,
+    what: str = "manifest",
+    devices: list[int] | None = None,
+) -> None:
+    """Forced-align `manifest` into `out`, one process per shard.
+
+    `devices` names the physical GPUs to pin the shards to, in order; without
+    it shard i lands on GPU i, which is only safe when the whole box is yours.
+    """
     if out.exists():
         logger.info(f"{what} {out.resolve()} exists, skipping")
         return
+
+    def pin(i: int) -> list[str]:
+        if devices is None and shards <= 1:
+            return []  # single shard, no device list: inherit the caller's visibility
+        return ["env", f"CUDA_VISIBLE_DEVICES={devices[i] if devices else i}"]
+
     # Aligning streams into a .partial that --resume picks up after an interrupt; `out`
     # itself only appears once a run finishes, so the check above cannot see half a file.
     if shards <= 1:
         part = out.with_suffix(".partial")
         subprocess.run(
-            [
+            pin(0)
+            + [
                 sys.executable,
                 "-m",
                 "training.scripts.align_data",
@@ -101,10 +120,9 @@ def align(manifest: Path, out: Path, shards: int, model: str, what: str = "manif
         chunk.write_text("".join(lines[i * per : (i + 1) * per]))
         part = out.with_suffix(f".shard{i}")
         parts.append((chunk, part))
-        env_prefix = ["env", f"CUDA_VISIBLE_DEVICES={i}"]
         procs.append(
             subprocess.Popen(
-                env_prefix
+                pin(i)
                 + [
                     sys.executable,
                     "-m",

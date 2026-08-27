@@ -1,0 +1,60 @@
+# Finetune the released 24-layer English teacher into Vietnamese on
+# VieNeu-TTS-140h (138h, 73.9k utterances, 193 speakers, 24 kHz mono).
+# Same shape as finetune_language.yaml: the backbone transfers, the text
+# embedding restarts because the sentencepiece model below was fitted on
+# Vietnamese transcripts. Prepare the data with
+#   python -m training.scripts.prepare_vieneu --align-devices 5,6
+# and launch with (this box: GPUs 4-6 are the experiment lanes, 0-3 and 7 are
+# other people's -- never widen CUDA_VISIBLE_DEVICES without checking):
+#   CUDA_VISIBLE_DEVICES=5,6 uv run torchrun --nproc-per-node 2 \
+#       training/train.py training/configs/vietnamese_finetune.yaml
+model_config: pocket_tts/config/english_2026-04_24l.yaml
+model_overrides:
+  # Fitted on this corpus' transcripts; vocab is train_tokenizer.py's default
+  # 4000, which is what the released config's lookup_table.n_bins already says.
+  flow_lm.lookup_table.tokenizer_path: data/vieneu_140h/tokenizer.model
+start_from_pretrained: true
+reset_text_embedding: true  # the tokenizer above is not the one these weights were trained with
+
+data:
+  # Orthographic Vietnamese, not the corpus' IPA column: it is what the CTC
+  # aligner spells, what the tokenizer was fitted on, and what a user types.
+  train_jsonl: data/vieneu_140h/train_aligned.jsonl
+  valid_jsonl: data/vieneu_140h/valid_aligned.jsonl
+  # Utterances here run 3-15s, so neither cap binds often.
+  max_duration_sec: 30.0
+  max_voice_prompt_sec: 5.0
+
+flow:
+  type: lsd
+  kwargs: {}
+
+flow_batch_multiplier: 4
+eos_loss_weight: 0.1
+text_dropout: 0.2
+voice_dropout: 0.2
+
+optim:
+  lr: 2e-4  # the text embedding starts random, so the backbone has to move with it
+  schedule: constant
+  warmup_steps: 1000
+
+run_dir: runs/vi_finetune_language
+# 2 GPUs x 32 x 1 = the effective batch of 64 the quality transition needs.
+batch_size: 32
+grad_accum_steps: 1
+max_steps: 250000  # WER plateaus early; the rest is acoustic quality
+stats_ema_steps: 1000
+ema_decay: 0.999
+log_freq: 50
+valid_freq: 2500
+ckpt_freq: 2500
+num_ckpt_keep: 3
+sample_cfg_coef: 2.0
+# Rank 0 speaks these into run_dir/samples/ every sample_freq steps, so the run
+# can be judged by ear. The defaults are English and would say nothing about a
+# Vietnamese model's progress.
+sample_sentences:
+- Xin chào, đây là một mô hình tổng hợp giọng nói tiếng Việt.
+- Quá trình huấn luyện vẫn đang chạy, nên giọng đọc này vẫn còn đang được cải thiện.
+- Trời hôm nay nắng đẹp, chúng tôi quyết định đi dạo quanh hồ và uống một ly cà phê.
