@@ -1,0 +1,254 @@
+"""FLEURS Vietnamese TTS eval: intelligibility (WER/CER) on an EXTERNAL test set.
+
+    python -m training.eval.fleurs_vi runs/vi_finetune_language \
+        --checkpoint runs/vi_finetune_language/keep/checkpoint_00027500.pt --limit 200
+
+For each sentence in data/eval_vi/fleurs_vi.jsonl: clone a fixed voice prompt,
+synthesize the sentence, transcribe it with a Vietnamese ASR, and score the
+transcript against FLEURS' own normalized reference with jiwer.
+
+Why this and not the run's own valid loss: the valid split holds out utterances
+whose document- and speaker-neighbours are in train, and flow_diag is a
+denoising error, not a perceptual one. FLEURS shares no speaker, domain or
+pipeline with the training corpus, and WER answers the question the loss
+cannot -- can a listener recover the words.
+
+The voice prompt is drawn from a manifest (the run's own valid split by
+default) and assigned round-robin from a small fixed pool, so the prompt is
+identical for every checkpoint compared. Two evals of two checkpoints then
+differ only by the model, which is the whole point of running it twice.
+
+Vietnamese normalization is NFC + casefold + punctuation strip, applied to both
+sides. FLEURS' `reference` column already ships in that form; this makes the
+hypothesis match it rather than trusting the ASR's punctuation.
+"""
+
+import argparse
+import json
+import logging
+import re
+import unicodedata
+from pathlib import Path
+
+import jiwer
+import sphn
+import torch
+
+from training.eval.librispeech import MIN_FRAMES, latents_to_wav, load_mono, load_run
+
+logger = logging.getLogger("eval_fleurs_vi")
+
+# Vietnamese-finetuned Whisper. Plain whisper-large-v3 also works (--asr) but
+# scores several points worse on Vietnamese, which would flatter the TTS.
+DEFAULT_ASR = "vinai/PhoWhisper-medium"
+DEFAULT_EVAL = "data/eval_vi/fleurs_vi.jsonl"
+
+_PUNCT = re.compile(r"[^\w\s]", re.UNICODE)
+
+
+def build_vi_transcriber(asr_name: str, device):
+    """Vietnamese Whisper decoding, hardened against the looping failure.
+
+    librispeech.py's transcriber asks for timestamps, which whisper needs for
+    long-form audio but which makes it hallucinate on short clips: it emits the
+    same clause over and over and never predicts an end timestamp. Three of the
+    first sixteen items came back at 7-25 words per second, against the 3-5 that
+    Vietnamese speech actually runs at, and those three alone moved corpus WER
+    from 20% to 96%. So: no timestamps, language pinned to Vietnamese rather
+    than detected per clip, greedy, and a token budget scaled to the clip's
+    duration so a loop is truncated instead of counted.
+    """
+    from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+
+    processor = AutoProcessor.from_pretrained(asr_name)
+    model = (
+        AutoModelForSpeechSeq2Seq.from_pretrained(asr_name, torch_dtype=torch.float16)
+        .to(device)
+        .eval()
+    )
+
+    def transcribe(wavs: list) -> list[str]:
+        inputs = processor(
+            wavs, sampling_rate=16000, return_tensors="pt", return_attention_mask=True
+        )
+        feats = inputs.input_features.to(device, torch.float16)
+        # ~4 words/s at ~2 tokens/word, tripled for headroom: generous for real
+        # speech, still a hard ceiling on a loop.
+        budget = int(max(len(w) for w in wavs) / 16000 * 24) + 16
+        with torch.no_grad():
+            ids = model.generate(
+                feats,
+                attention_mask=inputs.attention_mask.to(device),
+                language="vi",
+                task="transcribe",
+                return_timestamps=False,
+                do_sample=False,
+                num_beams=1,
+                max_new_tokens=min(budget, 440),
+            )
+        return processor.batch_decode(ids, skip_special_tokens=True)
+
+    return transcribe
+
+
+def normalize_vi(text: str) -> str:
+    """NFC, casefold, drop punctuation, collapse whitespace."""
+    text = unicodedata.normalize("NFC", text)
+    return " ".join(_PUNCT.sub(" ", text).casefold().split())
+
+
+def load_prompts(manifest: Path, n: int, min_sec: float, seed: int) -> list[str]:
+    """`n` voice-prompt paths, one per distinct speaker, deterministic."""
+    import random
+
+    by_speaker: dict[str, list[dict]] = {}
+    with open(manifest) as f:
+        for line in f:
+            d = json.loads(line)
+            if d["duration"] >= min_sec:
+                by_speaker.setdefault(d.get("speaker", "?"), []).append(d)
+    rng = random.Random(seed)
+    speakers = sorted(by_speaker)
+    rng.shuffle(speakers)
+    return [rng.choice(by_speaker[s])["path"] for s in speakers[:n]]
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("run_dir", type=Path)
+    p.add_argument("--checkpoint", default=None, help="defaults to the run's latest")
+    p.add_argument("--use-ema", action="store_true")
+    p.add_argument("--eval-jsonl", default=DEFAULT_EVAL)
+    p.add_argument("--prompts-from", default="data/vieneu_140h/valid_aligned.jsonl")
+    p.add_argument("--num-prompts", type=int, default=4, help="voices cycled over the sentences")
+    p.add_argument("--voice-sec", type=float, default=5.0)
+    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--asr", default=DEFAULT_ASR)
+    p.add_argument("--device", default="cuda:0")
+    p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--temp", type=float, default=0.3)
+    p.add_argument("--cfg", type=float, default=2.0)
+    p.add_argument("--n-steps", type=int, default=1)
+    p.add_argument("--eos-threshold", type=float, default=-1.0)
+    p.add_argument("--max-sec", type=float, default=40.0)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--save-audio", default=None)
+    p.add_argument("--out", default=None, help="results json (default: <run_dir>/fleurs_vi.json)")
+    args = p.parse_args()
+    logging.basicConfig(level=logging.INFO, format="[%(asctime)s %(levelname)s] %(message)s")
+
+    device = torch.device(args.device)
+    items = [json.loads(line) for line in open(args.eval_jsonl)]
+    if args.limit:
+        items = items[: args.limit]
+    prompts = load_prompts(Path(args.prompts_from), args.num_prompts, args.voice_sec, args.seed)
+    assert prompts, f"no voice prompts >= {args.voice_sec}s in {args.prompts_from}"
+    logger.info(f"{len(items)} sentences, {len(prompts)} voice prompts, asr={args.asr}")
+
+    model, mimi, step = load_run(
+        args.run_dir, device, use_ema=args.use_ema, checkpoint=args.checkpoint
+    )
+    torch.manual_seed(args.seed)
+    import sentencepiece as spm
+
+    from training.args import load_args
+    from training.modules.builders import load_model_config
+
+    cfg = load_model_config(
+        str(load_args(args.run_dir / "args.yaml").model_config),
+        load_args(args.run_dir / "args.yaml").model_overrides,
+    )
+    sp = spm.SentencePieceProcessor(model_file=str(cfg.flow_lm.lookup_table.tokenizer_path))
+
+    max_frames = int(args.max_sec * mimi.frame_rate)
+    records = []
+    voice_cache: dict[str, torch.Tensor] = {}
+    for start in range(0, len(items), args.batch_size):
+        chunk = items[start : start + args.batch_size]
+        tokens = [torch.tensor(sp.encode(c["text"]), dtype=torch.long) for c in chunk]
+        with torch.no_grad():
+            latents = []
+            for i, _c in enumerate(chunk):
+                path = prompts[(start + i) % len(prompts)]
+                if path not in voice_cache:
+                    wav = load_mono(path, mimi.sample_rate)[
+                        : int(args.voice_sec * mimi.sample_rate)
+                    ]
+                    voice_cache[path] = mimi.encode_to_latent(wav[None, None].to(device))[0]
+                latents.append(voice_cache[path])
+            outs = model.generate(
+                tokens,
+                latents,
+                max_frames=max_frames,
+                temp=args.temp,
+                n_steps=args.n_steps,
+                cfg_coef=args.cfg,
+                eos_threshold=args.eos_threshold,
+            )
+        for i, (item, lat) in enumerate(zip(chunk, outs, strict=True)):
+            rec = {
+                "id": item["id"],
+                "ref": normalize_vi(item["reference"]),
+                "hyp": "",
+                "silent": 0,
+                "no_eos": int(lat.shape[0] >= max_frames),
+                "gen_sec": float(lat.shape[0] / mimi.frame_rate),
+            }
+            if lat.shape[0] < MIN_FRAMES:
+                rec["silent"] = 1
+                records.append(rec)
+                continue
+            with torch.no_grad():
+                audio = latents_to_wav(mimi, lat, device)
+            rec["_wav"] = audio.cpu().numpy()
+            if args.save_audio:
+                Path(args.save_audio).mkdir(parents=True, exist_ok=True)
+                sphn.write_wav(
+                    f"{args.save_audio}/{start + i:04d}_{item['id']}.wav",
+                    rec["_wav"],
+                    int(mimi.sample_rate),
+                )
+            records.append(rec)
+        logger.info(f"generated {min(start + args.batch_size, len(items))}/{len(items)}")
+
+    transcribe = build_vi_transcriber(args.asr, device)
+    live = [r for r in records if "_wav" in r]
+    for s in range(0, len(live), args.batch_size):
+        batch = live[s : s + args.batch_size]
+        wavs = [
+            sphn.resample(
+                r.pop("_wav"), src_sample_rate=int(mimi.sample_rate), dst_sample_rate=16000
+            )
+            for r in batch
+        ]
+        for r, hyp in zip(batch, transcribe(wavs), strict=True):
+            r["hyp"] = normalize_vi(hyp)
+        logger.info(f"transcribed {min(s + args.batch_size, len(live))}/{len(live)}")
+
+    refs = [r["ref"] for r in records]
+    hyps = [r["hyp"] for r in records]
+    out = {
+        "step": step,
+        "checkpoint": str(args.checkpoint or "latest"),
+        "asr": args.asr,
+        "num_items": len(records),
+        "wer": jiwer.wer(refs, hyps),
+        "cer": jiwer.cer(refs, hyps),
+        "silent": sum(r["silent"] for r in records),
+        "no_eos": sum(r["no_eos"] for r in records),
+        "mean_gen_sec": sum(r["gen_sec"] for r in records) / max(len(records), 1),
+        "settings": {
+            k: getattr(args, k) for k in ("temp", "cfg", "n_steps", "eos_threshold", "seed")
+        },
+        "items": records,
+    }
+    dest = Path(args.out or (args.run_dir / "fleurs_vi.json"))
+    dest.write_text(json.dumps(out, ensure_ascii=False, indent=2))
+    logger.info(
+        f"step {step}: WER {out['wer']:.2%}  CER {out['cer']:.2%}  "
+        f"silent {out['silent']}  no_eos {out['no_eos']}  -> {dest}"
+    )
+
+
+if __name__ == "__main__":
+    main()
