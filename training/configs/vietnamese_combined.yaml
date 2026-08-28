@@ -1,0 +1,55 @@
+# Finetune the released 24-layer English teacher into Vietnamese on
+# VieNeu-TTS-140h + viVoice (~1,065h combined, 24 kHz, both measurably
+# full-band). Supersedes vietnamese_finetune.yaml, whose 138h corpus overfit:
+# valid flow_diag bottomed at step 10k and rose monotonically thereafter, and
+# external FLEURS WER tracked it (15.54% at 27.5k -> 17.98% at 100k).
+#
+#   python -m training.scripts.prepare_vivoice --align-devices 5,6
+#   CUDA_VISIBLE_DEVICES=5,6 uv run torchrun --nproc-per-node 2 \
+#       training/train.py training/configs/vietnamese_combined.yaml
+model_config: pocket_tts/config/english_2026-04_24l.yaml
+model_overrides:
+  # Refitted on the COMBINED transcripts: viVoice is YouTube speech and lexically
+  # quite unlike VieNeu's audiobooks, so the 140h-only tokenizer under-serves it.
+  flow_lm.lookup_table.tokenizer_path: data/vi_combined/tokenizer.model
+start_from_pretrained: true
+reset_text_embedding: true
+
+data:
+  train_jsonl: data/vi_combined/train_aligned.jsonl
+  valid_jsonl: data/vi_combined/valid_aligned.jsonl
+  max_duration_sec: 30.0
+  max_voice_prompt_sec: 5.0
+
+flow:
+  type: lsd
+  kwargs: {}
+
+flow_batch_multiplier: 4
+eos_loss_weight: 0.1
+text_dropout: 0.2
+voice_dropout: 0.2
+
+optim:
+  lr: 2e-4
+  schedule: constant
+  warmup_steps: 1000
+
+run_dir: runs/vi_combined
+batch_size: 32       # x 2 GPUs = the effective batch of 64 the recipe needs
+grad_accum_steps: 1
+max_steps: 250000    # a ceiling, not a target -- stop on the valid curve
+stats_ema_steps: 1000
+ema_decay: 0.999
+log_freq: 50
+valid_freq: 2500
+ckpt_freq: 2500
+# 20, not the usual 3. On the 138h run num_ckpt_keep: 3 deleted the best
+# checkpoint (step 10k) before we knew the valid curve had bottomed there.
+# 20 x 2.5 GB keeps a 50k-step window on disk for 50 GB.
+num_ckpt_keep: 20
+sample_cfg_coef: 2.0
+sample_sentences:
+- Xin chào, đây là một mô hình tổng hợp giọng nói tiếng Việt.
+- Quá trình huấn luyện vẫn đang chạy, nên giọng đọc này vẫn còn đang được cải thiện.
+- Trời hôm nay nắng đẹp, chúng tôi quyết định đi dạo quanh hồ và uống một ly cà phê.
