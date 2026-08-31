@@ -39,6 +39,9 @@ dev = [
     "mkdocs-autolinks-plugin>=0.7.1",
     "mkdocs-material>=9.7.1",
     "mkdocstrings-python>=2.0.1",
+    # eval/vi_itn.py: Vietnamese inverse text normalization (Linux x86_64 only --
+    # its pynini dependency has no wheels elsewhere)
+    "nemo-text-processing>=1.2.0",
     # scripts/prepare_vieneu.py: reads the dataset's arrow shards
     "pyarrow>=15.0",
     "pytest>=9.0.2",

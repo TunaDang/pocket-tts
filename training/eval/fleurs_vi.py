@@ -35,6 +35,7 @@ import sphn
 import torch
 
 from training.eval.librispeech import MIN_FRAMES, latents_to_wav, load_mono, load_run
+from training.eval.vi_itn import canon_hypothesis, canon_reference
 
 logger = logging.getLogger("eval_fleurs_vi")
 
@@ -146,6 +147,12 @@ def main() -> None:
     p.add_argument("--eos-threshold", type=float, default=-1.0)
     p.add_argument("--max-sec", type=float, default=40.0)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--no-itn",
+        action="store_true",
+        help="skip inverse text normalization of the written-form subset -- those sentences then "
+        "keep their verbalization mismatch and their WER is not meaningful (see training/eval/vi_itn.py)",
+    )
     p.add_argument("--save-audio", default=None)
     p.add_argument("--out", default=None, help="results json (default: <run_dir>/fleurs_vi.json)")
     args = p.parse_args()
@@ -203,6 +210,7 @@ def main() -> None:
             rec = {
                 "id": item["id"],
                 "written_form": has_written_form(item["text"]),
+                "raw": item["text"],
                 "ref": normalize_vi(item["reference"]),
                 "hyp": "",
                 "silent": 0,
@@ -245,8 +253,18 @@ def main() -> None:
     clean = [r for r in records if not r["written_form"]]
     written = [r for r in records if r["written_form"]]
 
-    def corpus(rs):
-        return jiwer.wer([r["ref"] for r in rs], [r["hyp"] for r in rs]) if rs else None
+    def corpus(rs, ref_key="ref", hyp_key="hyp"):
+        return jiwer.wer([r[ref_key] for r in rs], [r[hyp_key] for r in rs]) if rs else None
+
+    # Canonicalize the written-form subset so any valid reading of a number,
+    # date, time or spelled abbreviation scores as correct.
+    if written and not args.no_itn:
+        logger.info(f"inverse-normalizing {len(written)} written-form sentences")
+        for r in written:
+            r["ref_itn"] = canon_reference(r["raw"])
+            r["hyp_itn"] = canon_hypothesis(r["hyp"])
+    pooled_ref = [r["ref"] for r in clean] + [r.get("ref_itn", r["ref"]) for r in written]
+    pooled_hyp = [r["hyp"] for r in clean] + [r.get("hyp_itn", r["hyp"]) for r in written]
 
     out = {
         "step": step,
@@ -263,7 +281,13 @@ def main() -> None:
         else None,
         "n_clean": len(clean),
         "wer_written": corpus(written),
+        "wer_written_itn": corpus(written, "ref_itn", "hyp_itn")
+        if written and not args.no_itn
+        else None,
         "n_written": len(written),
+        # The fair whole-corpus number: clean sentences as-is, written-form
+        # sentences after inverse normalization.
+        "wer_overall": jiwer.wer(pooled_ref, pooled_hyp),
         "silent": sum(r["silent"] for r in records),
         "no_eos": sum(r["no_eos"] for r in records),
         "mean_gen_sec": sum(r["gen_sec"] for r in records) / max(len(records), 1),
@@ -274,13 +298,13 @@ def main() -> None:
     }
     dest = Path(args.out or (args.run_dir / "fleurs_vi.json"))
     dest.write_text(json.dumps(out, ensure_ascii=False, indent=2))
-    wc = f"{out['wer_clean']:.2%}" if out["wer_clean"] is not None else "n/a"
-    ww = f"{out['wer_written']:.2%}" if out["wer_written"] is not None else "n/a"
+    fmt = lambda v: f"{v:.2%}" if v is not None else "n/a"  # noqa: E731
     logger.info(
-        f"step {step}: WER {wc} on {out['n_clean']} clean sentences "
-        f"(pooled {out['wer']:.2%}; {out['n_written']} written-form sentences score {ww} "
-        f"and are dominated by verbalization mismatch, not synthesis error)  "
-        f"CER {out['cer']:.2%}  silent {out['silent']}  no_eos {out['no_eos']}  -> {dest}"
+        f"step {step}: WER {fmt(out['wer_overall'])} overall "
+        f"({fmt(out['wer_clean'])} on {out['n_clean']} clean, "
+        f"{fmt(out['wer_written_itn'])} on {out['n_written']} written-form after ITN, "
+        f"was {fmt(out['wer_written'])} before)  CER {out['cer']:.2%}  "
+        f"silent {out['silent']}  no_eos {out['no_eos']}  -> {dest}"
     )
 
 
