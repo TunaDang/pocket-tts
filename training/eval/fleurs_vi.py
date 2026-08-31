@@ -45,6 +45,20 @@ DEFAULT_EVAL = "data/eval_vi/fleurs_vi.jsonl"
 
 _PUNCT = re.compile(r"[^\w\s]", re.UNICODE)
 
+# Sentences whose INPUT carries written forms the model must verbalize: digits
+# and ALL-CAPS abbreviations. FLEURS' reference keeps the written form -- its
+# normalizer only strips punctuation, so "10:00 - 11:00" becomes the four
+# tokens "10 00 11 00" -- while a correct model says "mười giờ ..." and the ASR
+# transcribes what it hears. Every correctly spoken word then scores as an
+# error. On vi_vn this hits 108 of 500 sentences and inflates corpus WER by
+# roughly half, so the two populations are reported apart rather than pooled
+# into one misleading number.
+_WRITTEN = re.compile(r"\d|\b[A-ZĐ]{2,}\b")
+
+
+def has_written_form(text: str) -> bool:
+    return bool(_WRITTEN.search(text))
+
 
 def build_vi_transcriber(asr_name: str, device):
     """Vietnamese Whisper decoding, hardened against the looping failure.
@@ -188,6 +202,7 @@ def main() -> None:
         for i, (item, lat) in enumerate(zip(chunk, outs, strict=True)):
             rec = {
                 "id": item["id"],
+                "written_form": has_written_form(item["text"]),
                 "ref": normalize_vi(item["reference"]),
                 "hyp": "",
                 "silent": 0,
@@ -227,6 +242,12 @@ def main() -> None:
 
     refs = [r["ref"] for r in records]
     hyps = [r["hyp"] for r in records]
+    clean = [r for r in records if not r["written_form"]]
+    written = [r for r in records if r["written_form"]]
+
+    def corpus(rs):
+        return jiwer.wer([r["ref"] for r in rs], [r["hyp"] for r in rs]) if rs else None
+
     out = {
         "step": step,
         "checkpoint": str(args.checkpoint or "latest"),
@@ -234,6 +255,15 @@ def main() -> None:
         "num_items": len(records),
         "wer": jiwer.wer(refs, hyps),
         "cer": jiwer.cer(refs, hyps),
+        # The headline number: sentences with nothing to verbalize, so a word
+        # error is a real one.
+        "wer_clean": corpus(clean),
+        "cer_clean": jiwer.cer([r["ref"] for r in clean], [r["hyp"] for r in clean])
+        if clean
+        else None,
+        "n_clean": len(clean),
+        "wer_written": corpus(written),
+        "n_written": len(written),
         "silent": sum(r["silent"] for r in records),
         "no_eos": sum(r["no_eos"] for r in records),
         "mean_gen_sec": sum(r["gen_sec"] for r in records) / max(len(records), 1),
@@ -244,9 +274,13 @@ def main() -> None:
     }
     dest = Path(args.out or (args.run_dir / "fleurs_vi.json"))
     dest.write_text(json.dumps(out, ensure_ascii=False, indent=2))
+    wc = f"{out['wer_clean']:.2%}" if out["wer_clean"] is not None else "n/a"
+    ww = f"{out['wer_written']:.2%}" if out["wer_written"] is not None else "n/a"
     logger.info(
-        f"step {step}: WER {out['wer']:.2%}  CER {out['cer']:.2%}  "
-        f"silent {out['silent']}  no_eos {out['no_eos']}  -> {dest}"
+        f"step {step}: WER {wc} on {out['n_clean']} clean sentences "
+        f"(pooled {out['wer']:.2%}; {out['n_written']} written-form sentences score {ww} "
+        f"and are dominated by verbalization mismatch, not synthesis error)  "
+        f"CER {out['cer']:.2%}  silent {out['silent']}  no_eos {out['no_eos']}  -> {dest}"
     )
 
 
