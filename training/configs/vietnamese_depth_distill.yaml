@@ -1,0 +1,48 @@
+# Distill the completed 24-layer Vietnamese teacher into a 6-layer student.
+# Four GPUs x batch 16 preserves the reference effective batch of 64.
+model_config: pocket_tts/config/english.yaml
+model_overrides:
+  weights_path: weights/pocket-tts-24l-base.safetensors
+  flow_lm.lookup_table.tokenizer_path: data/vi_combined/tokenizer.model
+start_from_pretrained: false
+distill_cfg_coef: 2.0
+distill_teacher_config: pocket_tts/config/vietnamese_24l.yaml
+distill_teacher_weights: runs/vi_combined/checkpoint_00250000.pt
+distill_teacher_use_ema: true
+
+data:
+  train_jsonl: data/vi_combined/train_aligned.jsonl
+  valid_jsonl: data/vi_combined/valid_aligned.jsonl
+  max_duration_sec: 30.0
+  max_voice_prompt_sec: 5.0
+
+flow:
+  type: lsd
+  kwargs: {}
+
+# The teacher targets are always fully conditioned; the student is used with
+# cfg=1 after distillation, so conditioning dropout must remain disabled.
+text_dropout: 0.0
+voice_dropout: 0.0
+
+optim:
+  lr: 4e-4
+  schedule: cosine
+  warmup_steps: 1000
+
+run_dir: runs/vi_depth_distill
+batch_size: 16
+grad_accum_steps: 1
+max_steps: 200000
+ema_decay: 0.9999
+log_freq: 50
+valid_freq: 2500
+ckpt_freq: 2500
+# Retain a 50k-step window while model.safetensors is refreshed atomically at
+# every checkpoint. The latest optimizer sidecar is retained for exact resume.
+num_ckpt_keep: 20
+sample_cfg_coef: 1.0
+sample_sentences:
+- Xin chào, đây là một mô hình tổng hợp giọng nói tiếng Việt.
+- Quá trình chưng cất đang chuyển mô hình giáo viên thành mô hình nhỏ hơn.
+- Trời hôm nay nắng đẹp, chúng tôi quyết định đi dạo quanh hồ.
