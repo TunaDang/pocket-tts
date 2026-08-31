@@ -1,0 +1,67 @@
+# Vietnamese 24-layer teacher, trained on VieNeu-TTS-140h + viVoice (~1,065h).
+# Fully local: no hf:// URI, so it resolves with no HuggingFace cache present.
+#   uv run pocket-tts generate --config pocket_tts/config/vietnamese_24l.yaml \
+#       --checkpoint runs/vi_combined/checkpoint_00250000.pt \
+#       --voice <prompt.wav> --text "Xin chào"
+# The EMA export runs/vi_combined/model.safetensors already contains Mimi, so it is
+# self-contained on its own; the .pt checkpoints are not.
+# Local copy of the released 24-layer weights. Two reasons this is not an hf:// URI:
+# the .pt checkpoints carry only flow_lm, so Mimi is loaded from here for any eval or
+# resume (builders.py:162 refuses to build without it); and a local path survives the
+# HF cache moving or its ~/.cache/huggingface symlink going away.
+weights_path: weights/pocket-tts-24l-base.safetensors
+
+default_temperature: 0.3
+flow_lm:
+  insert_bos_before_voice: true
+  dtype: float32
+  flow:
+    depth: 6
+    dim: 512
+  transformer:
+    d_model: 1024
+    hidden_scale: 4
+    max_period: 10000
+    num_heads: 16
+    num_layers: 24
+  lookup_table:
+    dim: 1024
+    n_bins: 4000
+    tokenizer: sentencepiece
+    # Fitted on the combined VieNeu + viVoice transcripts.
+    tokenizer_path: data/vi_combined/tokenizer.model
+mimi:
+  dtype: float32
+  sample_rate: 24000
+  inner_dim: 32
+  outer_dim: 512
+  channels: 1
+  frame_rate: 12.5
+  seanet:
+    dimension: 512
+    channels: 1
+    n_filters: 64
+    n_residual_layers: 1
+    ratios:
+    - 6
+    - 5
+    - 4
+    kernel_size: 7
+    residual_kernel_size: 3
+    last_kernel_size: 3
+    dilation_base: 2
+    pad_mode: constant
+    compress: 2
+  transformer:
+    d_model: 512
+    num_heads: 8
+    num_layers: 2
+    layer_scale: 0.01
+    context: 250
+    dim_feedforward: 2048
+    input_dimension: 512
+    output_dimensions:
+    - 512
+  quantizer:
+    dimension: 32
+    output_dimension: 512
