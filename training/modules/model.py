@@ -16,7 +16,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from pocket_tts.conditioners.base import TokenizedText
 from pocket_tts.modules.stateful_module import increment_steps, init_states
 
 from ..args import TrainArgs
@@ -146,7 +145,7 @@ class TrainableTTS(nn.Module):
 
         rows = []
         for tokens, voice in zip(text_tokens, voice_latents, strict=True):
-            t_emb = fl.conditioner(TokenizedText(tokens[None].to(device)))[0]
+            t_emb = fl.conditioner(tokens[None].to(device))[0]
             v_emb = F.linear(
                 voice[None].to(device, fl.speaker_proj_weight.dtype), fl.speaker_proj_weight
             )[0]

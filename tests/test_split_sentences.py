@@ -2,8 +2,8 @@
 
 import pytest
 
-from pocket_tts.conditioners.text import get_default_tokenizer
 from pocket_tts.models.tts_model import split_into_best_sentences
+from pocket_tts.modules.text_conditioner import get_default_tokenizer
 
 
 @pytest.fixture(scope="session")
@@ -65,7 +65,7 @@ def test_long_sentence_with_commas_respects_max_tokens(tokenizer):
         tokenizer, text, max_tokens, pad_with_spaces_for_short_inputs=False, remove_semicolons=False
     )
     for chunk in chunks:
-        token_count = len(tokenizer(chunk.strip()).tokens[0].tolist())
+        token_count = len(tokenizer(chunk.strip())[0].tolist())
         # Allow some tolerance since comma clauses may vary in size
         assert token_count <= max_tokens * 2, (
             f"Chunk '{chunk[:50]}...' has {token_count} tokens, expected ~{max_tokens}"
