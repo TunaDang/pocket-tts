@@ -31,7 +31,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from training.args import TrainArgs, dump_args, load_args, save_args
 from training.checkpointing import EMA, latest_checkpoint, load_checkpoint, save_checkpoint
-from training.dataloader import DataLoader, encode_batch
+from training.dataloader import DataLoader, SubprocessDataLoader, encode_batch
 from training.distributed import (
     avg_across_ranks,
     get_rank,
@@ -45,6 +45,7 @@ from training.train_utils import (
     ProgressLog,
     _compile_models,
     add_file_logging,
+    ensure_train_latents,
     git_commit,
     lr_at,
     setup_logging,
@@ -77,6 +78,8 @@ def setup(config_path: str) -> Run:
     """Resolve the config, build the models, restore any checkpoint."""
     setup_logging()
     torch.backends.cuda.matmul.allow_tf32 = True  # fp32 islands (Mimi encode)
+    # cuDNN's bf16 SDPA backward emits NaN at larger batch shapes and is not faster.
+    torch.backends.cuda.enable_cudnn_sdp(False)
     args = load_args(config_path)
     device = init_distributed()
     rank, world_size = get_rank(), get_world_size()
@@ -101,13 +104,19 @@ def setup(config_path: str) -> Run:
                 "    python -m training.scripts.prepare_data --hours 200\n"
                 "or point data.train_jsonl / data.valid_jsonl at your own manifests."
             )
-
+    if args.data.valid_jsonl and Path(args.data.valid_jsonl).with_suffix(".meta.json").exists():
+        raise SystemExit(
+            f"valid_jsonl is a precomputed-latents manifest: {args.data.valid_jsonl}\n"
+            "Validation must encode audio directly so its metrics stay exact and "
+            "comparable; point valid_jsonl at the original manifest."
+        )
     if rank == 0:
         save_args(args, run_dir / "args.yaml")
 
     model, mimi, _config = build_models(args)
     model.to(device)
     mimi.to(device)
+    ensure_train_latents(args, mimi, device, rank, world_size)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if rank == 0:
         logger.info(f"flow_lm + objective: {n_params / 1e6:.1f}M trainable params")
@@ -163,11 +172,12 @@ def main(config_path: str) -> None:
     optimizer, ema, device, rank = run.optimizer, run.ema, run.device, run.rank
     progress, start_step = run.progress, run.start_step
 
-    tokenize = model.flow_lm.conditioner.tokenizer.sp.encode
+    sentence_piece = model.flow_lm.conditioner.tokenizer.sp
+    tokenize = sentence_piece.encode
     train_loader = iter(
-        DataLoader(
+        SubprocessDataLoader(
             args.data.train_jsonl,
-            tokenize,
+            sentence_piece,
             args.batch_size,
             mimi.sample_rate,
             mimi.frame_rate,
@@ -175,8 +185,9 @@ def main(config_path: str) -> None:
             args.data.max_voice_prompt_sec,
             rank,
             run.world_size,
-            seed=args.seed + rank,
+            seed=args.seed,
             shuffle=args.data.shuffle,
+            num_procs=args.data.loader_procs,
         )
     )
 
@@ -218,6 +229,10 @@ def main(config_path: str) -> None:
             else:
                 scaled.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.optim.max_norm)
+        if not torch.isfinite(grad_norm):
+            # Stop before the NaN reaches the weights: the run would otherwise
+            # keep training and checkpointing garbage, and auto-resume reloads it.
+            raise SystemExit(f"non-finite gradient at step {step}")
         optimizer.step()
         if ema is not None:
             ema.update(model)
@@ -241,7 +256,8 @@ def main(config_path: str) -> None:
             logger.info(f"per-step logging done, logging every {args.log_freq} steps from now on")
 
         if sample_voice is None:
-            sample_voice = voice_prompt_latents[0].detach().clone()
+            n = int(num_voice_prompt_frames[0])
+            sample_voice = voice_prompt_latents[0, :n].detach().clone()
         if (
             rank == 0
             and args.sample_sentences
